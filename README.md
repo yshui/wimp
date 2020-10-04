@@ -4,10 +4,10 @@ A simple program to show you where your pointer is.
 
 ![Demo](assets/demo.gif)
 
-## To build
+## To install
 
-`cargo build`
+`cargo install wimp`
 
 ## To run
 
-`./wimp`
+`wimp`
