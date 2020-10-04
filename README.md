@@ -6,6 +6,9 @@ A simple program to show you where your pointer is.
 
 ## To install
 
+You need to have vulkan installed on your system
+ Then run:
+
 `cargo install wimp`
 
 ## To run
