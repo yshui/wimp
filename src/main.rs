@@ -12,11 +12,17 @@ struct XcbHandle {
 
 unsafe impl raw_window_handle::HasRawWindowHandle for XcbHandle {
     fn raw_window_handle(&self) -> raw_window_handle::RawWindowHandle {
-        raw_window_handle::RawWindowHandle::Xcb(raw_window_handle::unix::XcbHandle {
-            window: self.window,
-            connection: self.conn,
-            ..raw_window_handle::unix::XcbHandle::empty()
-        })
+        let mut handle = raw_window_handle::XcbWindowHandle::empty();
+        handle.window = self.window;
+        handle.visual_id = 0;
+        raw_window_handle::RawWindowHandle::Xcb(handle)
+    }
+}
+unsafe impl raw_window_handle::HasRawDisplayHandle for XcbHandle {
+    fn raw_display_handle(&self) -> raw_window_handle::RawDisplayHandle {
+        let mut handle = raw_window_handle::XcbDisplayHandle::empty();
+        handle.connection = self.conn;
+        raw_window_handle::RawDisplayHandle::Xcb(handle)
     }
 }
 
@@ -43,7 +49,7 @@ fn slice_to_u32(mut slice: &[u8]) -> Vec<u32> {
 #[async_std::main]
 async fn main() -> Result<()> {
     env_logger::init();
-    let (conn, screen) = x11rb::rust_connection::RustConnection::connect(None)?;
+    let (conn, screen) = x11rb::xcb_ffi::XCBConnection::connect(None)?;
     let screen = &conn.setup().roots[screen];
     let mut pointer = conn.query_pointer(screen.root)?.reply()?;
 
@@ -79,12 +85,12 @@ async fn main() -> Result<()> {
     let visual32_info = depth32_info
         .visuals
         .iter()
-        .find(|v| v.bits_per_rgb_value == 8 && v.class == xproto::VisualClass::TrueColor)
+        .find(|v| v.bits_per_rgb_value == 8 && v.class == xproto::VisualClass::TRUE_COLOR)
         .expect("No usable 32 bit visual found");
 
     let colormap_id = conn.generate_id()?;
     conn.create_colormap(
-        xproto::ColormapAlloc::None,
+        xproto::ColormapAlloc::NONE,
         colormap_id,
         screen.root,
         visual32_info.visual_id,
@@ -101,7 +107,7 @@ async fn main() -> Result<()> {
         w,
         h,
         0,
-        xproto::WindowClass::InputOutput,
+        xproto::WindowClass::INPUT_OUTPUT,
         visual32_info.visual_id,
         &xproto::CreateWindowAux::new()
             .backing_pixel(screen.white_pixel)
@@ -112,29 +118,26 @@ async fn main() -> Result<()> {
     .check()?;
 
     conn.shape_rectangles(
-        shape::SO::Intersect,
-        shape::SK::Input,
-        xproto::ClipOrdering::YSorted,
+        shape::SO::INTERSECT,
+        shape::SK::INPUT,
+        xproto::ClipOrdering::Y_SORTED,
         wid,
         0,
         0,
         &[],
-    )?.check()?;
+    )?
+    .check()?;
     conn.map_window(wid)?.check()?;
 
-    let mut xcb_screen = 0;
-    let xcb_conn =
-        unsafe { xcb::ffi::base::xcb_connect(::std::ptr::null(), &mut xcb_screen as *mut _) };
-    let window_handle = XcbHandle {
+    let instance = wgpu::Instance::new(wgpu::Backends::PRIMARY);
+    let surface = unsafe { instance.create_surface(&XcbHandle {
         window: wid,
-        conn: xcb_conn as *mut _,
-    };
-
-    let instance = wgpu::Instance::new(wgpu::BackendBit::PRIMARY);
-    let surface = unsafe { instance.create_surface(&window_handle) };
+        conn: conn.get_raw_xcb_connection(),
+    }) };
     let adapter_opt = wgpu::RequestAdapterOptions {
         power_preference: wgpu::PowerPreference::HighPerformance,
         compatible_surface: Some(&surface),
+        force_fallback_adapter: false,
     };
 
     let adapter = instance
@@ -158,67 +161,80 @@ async fn main() -> Result<()> {
     let vert = slice_to_u32(include_bytes!(concat!(env!("OUT_DIR"), "/vert.spv")));
     let frag = slice_to_u32(include_bytes!(concat!(env!("OUT_DIR"), "/frag.spv")));
 
-    let vert = device.create_shader_module(wgpu::ShaderModuleSource::SpirV(vert.as_slice().into()));
-    let frag = device.create_shader_module(wgpu::ShaderModuleSource::SpirV(frag.as_slice().into()));
+    let vert = unsafe {
+        device.create_shader_module_spirv(&wgpu::ShaderModuleDescriptorSpirV {
+            label: None,
+            source: vert.as_slice().into(),
+        })
+    };
+    let frag = unsafe {
+        device.create_shader_module_spirv(&wgpu::ShaderModuleDescriptorSpirV {
+            label: None,
+            source: frag.as_slice().into(),
+        })
+    };
 
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: None,
         bind_group_layouts: &[],
         push_constant_ranges: &[wgpu::PushConstantRange {
-            stages: wgpu::ShaderStage::FRAGMENT,
+            stages: wgpu::ShaderStages::FRAGMENT,
             range: 0..4,
         }],
     });
     let pipeline_d = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: None,
         layout: Some(&pipeline_layout),
-        vertex_stage: wgpu::ProgrammableStageDescriptor {
-            entry_point: "main",
-            module: &vert,
-        },
-        fragment_stage: Some(wgpu::ProgrammableStageDescriptor {
+        fragment: Some(wgpu::FragmentState {
             entry_point: "main",
             module: &frag,
+            targets: &[Some(wgpu::ColorTargetState {
+                blend: Some(wgpu::BlendState::REPLACE),
+                format: wgpu::TextureFormat::Bgra8Unorm,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
         }),
-        rasterization_state: None,
-        primitive_topology: wgpu::PrimitiveTopology::TriangleList,
-        depth_stencil_state: None,
-        vertex_state: wgpu::VertexStateDescriptor {
-            index_format: wgpu::IndexFormat::Uint16,
-            vertex_buffers: &[wgpu::VertexBufferDescriptor {
-                stride: 8,
-                step_mode: wgpu::InputStepMode::Vertex,
-                attributes: &[wgpu::VertexAttributeDescriptor {
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            cull_mode: None,
+            front_face: wgpu::FrontFace::Ccw,
+            strip_index_format: None,
+            polygon_mode: wgpu::PolygonMode::Fill,
+            unclipped_depth: false,
+            conservative: false,
+        },
+        depth_stencil: None,
+        vertex: wgpu::VertexState {
+            module: &vert,
+            entry_point: "main",
+            buffers: &[wgpu::VertexBufferLayout {
+                array_stride: 8,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &[wgpu::VertexAttribute {
                     offset: 0,
-                    format: wgpu::VertexFormat::Float2,
+                    format: wgpu::VertexFormat::Float32x2,
                     shader_location: 0,
                 }],
             }],
         },
-        color_states: &[wgpu::ColorStateDescriptor {
-            format: wgpu::TextureFormat::Bgra8Unorm,
-            alpha_blend: wgpu::BlendDescriptor::REPLACE,
-            color_blend: wgpu::BlendDescriptor::REPLACE,
-            write_mask: wgpu::ColorWrite::ALL,
-        }],
-        sample_count: 1,
-        sample_mask: !0,
-        alpha_to_coverage_enabled: false,
+        multisample: wgpu::MultisampleState::default(),
+        multiview: None,
     });
 
-    let sc_desc = wgpu::SwapChainDescriptor {
-        usage: wgpu::TextureUsage::OUTPUT_ATTACHMENT,
+    let sc_desc = wgpu::SurfaceConfiguration {
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
         format: wgpu::TextureFormat::Bgra8Unorm,
         width: w as u32,
         height: h as u32,
         present_mode: wgpu::PresentMode::Fifo,
+        alpha_mode: wgpu::CompositeAlphaMode::Auto,
     };
 
     let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: None,
         mapped_at_creation: true,
         size: 8 * 6,
-        usage: wgpu::BufferUsage::MAP_WRITE | wgpu::BufferUsage::VERTEX,
+        usage: wgpu::BufferUsages::MAP_WRITE | wgpu::BufferUsages::VERTEX,
     });
 
     {
@@ -237,7 +253,7 @@ async fn main() -> Result<()> {
     }
     vertex_buffer.unmap();
 
-    let mut sc = device.create_swap_chain(&surface, &sc_desc);
+    surface.configure(&device, &sc_desc);
 
     let start = ::std::time::Instant::now();
     loop {
@@ -245,9 +261,9 @@ async fn main() -> Result<()> {
             break;
         }
         let now = ::std::time::Instant::now();
-        let frame = sc.get_current_frame()?.output;
+        let frame = surface.get_current_texture()?;
         let elapsed_ms = (now - start).as_secs_f32();
-        let push_constant = std::slice::from_ref(unsafe { std::mem::transmute(&elapsed_ms) });
+        let push_constant = elapsed_ms.to_ne_bytes();
         let new_pointer = conn.query_pointer(screen.root)?.reply()?;
         if (new_pointer.root_x, new_pointer.root_y) != (pointer.root_x, pointer.root_y) {
             conn.configure_window(
@@ -262,23 +278,28 @@ async fn main() -> Result<()> {
         let mut encoder =
             device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         {
+            let view = frame
+                .texture
+                .create_view(&wgpu::TextureViewDescriptor::default());
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                color_attachments: &[wgpu::RenderPassColorAttachmentDescriptor {
-                    attachment: &frame.view,
+                label: None,
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                         store: true,
                     },
-                }],
+                })],
                 depth_stencil_attachment: None,
             });
             pass.set_pipeline(&pipeline_d);
-            pass.set_push_constants(wgpu::ShaderStage::FRAGMENT, 0, push_constant);
+            pass.set_push_constants(wgpu::ShaderStages::FRAGMENT, 0, &push_constant);
             pass.set_vertex_buffer(0, vertex_buffer.slice(..));
             pass.draw(0..6, 0..1);
         }
         queue.submit(Some(encoder.finish()));
+        frame.present();
     }
 
     Ok(())
